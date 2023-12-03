@@ -18,6 +18,7 @@
 
 #include <cmath>
 
+#include "builtin_interfaces/msg/time.hpp"
 #include "cartographer/common/math.h"
 #include "cartographer/common/port.h"
 #include "cartographer/common/time.h"
@@ -35,8 +36,7 @@
 #include "pcl/point_cloud.h"
 #include "pcl/point_types.h"
 #include "pcl_conversions/pcl_conversions.h"
-#include "builtin_interfaces/msg/time.hpp"
-//#include "ros/serialization.h"
+// #include "ros/serialization.h"
 #include "sensor_msgs/msg/imu.hpp"
 #include "sensor_msgs/msg/laser_scan.hpp"
 #include "sensor_msgs/msg/multi_echo_laser_scan.hpp"
@@ -85,9 +85,9 @@ using ::cartographer::transform::Rigid3d;
 using ::cartographer_ros_msgs::msg::LandmarkEntry;
 using ::cartographer_ros_msgs::msg::LandmarkList;
 
-sensor_msgs::msg::PointCloud2 PreparePointCloud2Message(const int64_t timestamp,
-                                                   const std::string& frame_id,
-                                                   const int num_points) {
+sensor_msgs::msg::PointCloud2 PreparePointCloud2Message(
+    const int64_t timestamp, const std::string& frame_id,
+    const int num_points) {
   sensor_msgs::msg::PointCloud2 msg;
   msg.header.stamp = ToRos(::cartographer::common::FromUniversal(timestamp));
   msg.header.frame_id = frame_id;
@@ -140,6 +140,18 @@ LaserScanToPointCloudWithIntensities(const LaserMessageType& msg) {
     CHECK_GT(msg.angle_min, msg.angle_max);
   }
   PointCloudWithIntensities point_cloud;
+  /*计算两次消息之间的时间增量解决帧间频率波动*/
+  static double timestamp_current = 0;
+  static double timestamp_last = 0;
+  double time_increment_vary;
+  timestamp_last = timestamp_current;
+  timestamp_current = msg.header.stamp.sec + msg.header.stamp.nanosec / 1e9;
+  if (timestamp_last != 0) {
+    time_increment_vary = (timestamp_current - timestamp_last) /
+                          (6.2831852 / msg.angle_increment);
+  } else
+    time_increment_vary = msg.time_increment;
+  /*end*/
   float angle = msg.angle_min;
   for (size_t i = 0; i < msg.ranges.size(); ++i) {
     const auto& echoes = msg.ranges[i];
@@ -149,7 +161,10 @@ LaserScanToPointCloudWithIntensities(const LaserMessageType& msg) {
         const Eigen::AngleAxisf rotation(angle, Eigen::Vector3f::UnitZ());
         const cartographer::sensor::TimedRangefinderPoint point{
             rotation * (first_echo * Eigen::Vector3f::UnitX()),
-            i * msg.time_increment};
+            static_cast<float>(
+                i *
+                time_increment_vary)};  // msg.time_increment->time_increment_vary
+
         point_cloud.points.push_back(point);
         if (msg.intensities.size() > 0) {
           CHECK_EQ(msg.intensities.size(), msg.ranges.size());
@@ -163,6 +178,20 @@ LaserScanToPointCloudWithIntensities(const LaserMessageType& msg) {
     }
     angle += msg.angle_increment;
   }
+  /*将点云集合中的点的位置进行反转，解决数据反序问题。*/
+  std::vector<float> time_tempx;
+  std::vector<float> time_tempy;
+  for (auto& point : point_cloud.points) {
+    time_tempx.push_back(point.position.x());
+    time_tempy.push_back(point.position.y());
+  }
+  int i_time = 0;
+  for (auto& point : point_cloud.points) {
+    point.position.x() = time_tempx[point_cloud.points.size() - 1 - i_time];
+    point.position.y() = time_tempy[point_cloud.points.size() - 1 - i_time];
+    i_time++;
+  }
+  /*end*/
   ::cartographer::common::Time timestamp = FromRos(msg.header.stamp);
   if (!point_cloud.points.empty()) {
     const double duration = point_cloud.points.back().time;
@@ -191,7 +220,7 @@ sensor_msgs::msg::PointCloud2 ToPointCloud2Message(
     const ::cartographer::sensor::TimedPointCloud& point_cloud) {
   auto msg = PreparePointCloud2Message(timestamp, frame_id, point_cloud.size());
   size_t offset = 0;
-  float * const data = reinterpret_cast<float*>(&msg.data[0]);
+  float* const data = reinterpret_cast<float*>(&msg.data[0]);
   for (const auto& point : point_cloud) {
     data[offset++] = point.position.x();
     data[offset++] = point.position.y();
